@@ -14,7 +14,7 @@ from typing import Any, Tuple
 from .._C.libtriton.triton import (add_external_libs, compile_ptx_to_cubin,
                                    get_shared_memory_size, ir,
                                    translate_llvmir_to_hsaco, translate_llvmir_to_ptx,
-                                   translate_triton_gpu_to_llvmir)
+                                   translate_triton_gpu_to_llvmir, instantiate_thread_pool)
 from ..common.backend import get_backend, path_to_ptxas
 # from ..runtime import driver, jit, JITFunction
 # TODO: runtime.errors
@@ -45,7 +45,6 @@ def ttir_compute_capability_rewrite(mod, arch):
         pm.add_rewrite_tensor_pointer_pass(arch)
     pm.run(mod)
     return mod
-
 
 def optimize_ttir(mod, arch):
     mod = inline_triton_ir(mod)
@@ -604,3 +603,10 @@ class CompiledKernel:
             os.remove(path)
         self.asm['sass'] = self.sass
         return self.sass
+
+
+def set_thread_pool():
+    instantiate_thread_pool()
+
+
+
