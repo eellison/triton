@@ -17,7 +17,7 @@ from .runtime import (
     MockTensor,
 )
 from .runtime.jit import jit
-from .compiler import compile, CompilationError
+from .compiler import compile, CompilationError, set_thread_pool
 
 from . import language
 from . import testing
@@ -27,6 +27,7 @@ __all__ = [
     "cdiv",
     "CompilationError",
     "compile",
+    "set_thread_pool",
     "Config",
     "heuristics",
     "impl",

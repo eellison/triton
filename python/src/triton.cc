@@ -50,7 +50,11 @@
 
 #include <Python.h>
 #include <cctype>
+#include <condition_variable>
 #include <fstream>
+#include <functional>
+#include <iostream>
+#include <mutex>
 #include <optional>
 #include <pybind11/buffer_info.h>
 #include <pybind11/embed.h>
@@ -58,11 +62,65 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
+#include <queue>
 #include <regex>
 #include <signal.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
+
+#include <llvm/Support/ThreadPool.h>
+#include <mutex>
+#include <optional>
+
+class ThreadPoolWrapper {
+private:
+  std::optional<llvm::ThreadPool> threadPool;
+  static ThreadPoolWrapper instance;
+  static std::mutex mtx;
+
+public:
+  ThreadPoolWrapper() = default;
+
+  static llvm::ThreadPool &getInstance() {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    if (!instance.threadPool) {
+      instance.threadPool.emplace(llvm::hardware_concurrency());
+    }
+
+    return *instance.threadPool;
+  }
+
+  static bool isThreadPoolDefined() {
+    std::lock_guard<std::mutex> lock(mtx);
+    return instance.threadPool.has_value();
+  }
+
+  // since we're sharing with MLIR context thread pool can not be discarded
+  // while those live static void discardThreadPool() {
+  //     std::lock_guard<std::mutex> lock(mtx);
+  //     instance.threadPool.reset();
+  // }
+};
+
+// Define the static members
+ThreadPoolWrapper ThreadPoolWrapper::instance;
+std::mutex ThreadPoolWrapper::mtx;
+
+template <typename Func, typename... Args>
+auto executeWithThreadPool(Func &&fn, Args &&...args)
+    -> decltype(fn(std::forward<Args>(args)...)) {
+  if (ThreadPoolWrapper::isThreadPoolDefined()) {
+    auto future = ThreadPoolWrapper::getInstance().async(
+        std::forward<Func>(fn), std::forward<Args>(args)...);
+    return future.get();
+  } else {
+    return fn(std::forward<Args>(args)...);
+  }
+}
 
 #include <pybind11/numpy.h>
 namespace py = pybind11;
@@ -254,7 +312,19 @@ void init_triton_ir(py::module &&m) {
       .value("UMAX", mlir::triton::RMWOp::UMAX);
 
   py::class_<mlir::MLIRContext>(m, "context", py::module_local())
-      .def(py::init<>())
+      .def(py::init([]() {
+             auto context = std::make_unique<mlir::MLIRContext>();
+             if (ThreadPoolWrapper::isThreadPoolDefined()) {
+               context->disableMultithreading();
+               context->setThreadPool(ThreadPoolWrapper::getInstance());
+              //  std::cout << " New Path \n";
+             } else { 
+                // std::cout << " Other path \n";
+             }
+             return context.release();
+           }),
+           py::return_value_policy::take_ownership) // Specify the ownership
+                                                    // policy
       .def("load_triton", [](mlir::MLIRContext &self) {
         self.getOrLoadDialect<mlir::triton::TritonDialect>();
         self.getOrLoadDialect<mlir::index::IndexDialect>();
@@ -265,12 +335,6 @@ void init_triton_ir(py::module &&m) {
         self.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
         self.getOrLoadDialect<mlir::tensor::TensorDialect>();
       });
-  // .def(py::init([](){
-  //   mlir::MLIRContext context;
-  //   context.getOrLoadDialect<mlir::triton.TritonDialect>();
-  //   // TODO: should we return a (raw/unique) pointer here?
-  //   return context;
-  // }));
 
   // py::class_<ir::value>(m, "value")
   //     .def("multiple_of", [](ir::value *self, int val) {
@@ -1866,17 +1930,19 @@ void init_triton_translation(py::module &m) {
          mlir::triton::gpu::TMAMetadataTy &tmaInfos,
          mlir::triton::Target target) {
         py::gil_scoped_release allow_threads;
-        llvm::LLVMContext llvmContext;
-        auto llvmModule = ::mlir::triton::translateTritonGPUToLLVMIR(
-            &llvmContext, op, computeCapability, tmaInfos, target);
-        if (!llvmModule)
-          llvm::report_fatal_error("Failed to translate TritonGPU to LLVM IR.");
+        return executeWithThreadPool([&]() {
+          llvm::LLVMContext llvmContext;
+          auto llvmModule = ::mlir::triton::translateTritonGPUToLLVMIR(
+              &llvmContext, op, computeCapability, tmaInfos, target);
+          if (!llvmModule)
+            llvm::report_fatal_error("Failed to translate TritonGPU to LLVM IR.");
 
-        std::string str;
-        llvm::raw_string_ostream os(str);
-        llvmModule->print(os, nullptr);
-        os.flush();
-        return str;
+          std::string str;
+          llvm::raw_string_ostream os(str);
+          llvmModule->print(os, nullptr);
+          os.flush();
+          return str;
+        });
       },
       ret::take_ownership);
 
@@ -1885,24 +1951,39 @@ void init_triton_translation(py::module &m) {
       [](const std::string llvmIR, int capability, int version,
          bool enable_fp_fusion) -> std::string {
         py::gil_scoped_release allow_threads;
-        // create LLVM module from C++
-        llvm::LLVMContext context;
-        std::unique_ptr<llvm::MemoryBuffer> buffer =
-            llvm::MemoryBuffer::getMemBuffer(llvmIR.c_str());
-        llvm::SMDiagnostic error;
-        std::unique_ptr<llvm::Module> module =
-            llvm::parseIR(buffer->getMemBufferRef(), error, context);
-        if (!module) {
-          llvm::report_fatal_error(
-              "failed to parse IR: " + error.getMessage() +
-              "lineno: " + std::to_string(error.getLineNo()));
-        }
-        // translate module to PTX
-        auto ptxCode = triton::translateLLVMIRToPTX(*module, capability,
-                                                    version, enable_fp_fusion);
-        return ptxCode;
+        return executeWithThreadPool([&]() -> std::string {
+          // create LLVM module from C++
+          llvm::LLVMContext context;
+          std::unique_ptr<llvm::MemoryBuffer> buffer =
+              llvm::MemoryBuffer::getMemBuffer(llvmIR.c_str());
+          llvm::SMDiagnostic error;
+          std::unique_ptr<llvm::Module> module =
+              llvm::parseIR(buffer->getMemBufferRef(), error, context);
+          if (!module) {
+            llvm::report_fatal_error(
+                "failed to parse IR: " + error.getMessage() +
+                "lineno: " + std::to_string(error.getLineNo()));
+          }
+          // translate module to PTX
+          auto ptxCode = triton::translateLLVMIRToPTX(*module, capability,
+                                                      version, enable_fp_fusion);
+          return ptxCode;
+        });
       },
       ret::take_ownership);
+
+  m.def("get_num_threads", []() {
+    if (!ThreadPoolWrapper::isThreadPoolDefined()) {
+      return 0;
+    } else {
+      return static_cast<int>(
+          ThreadPoolWrapper::getInstance().getThreadCount());
+    }
+  });
+
+  m.def("instantiate_thread_pool", []() {
+    ThreadPoolWrapper::getInstance();
+  });
 
   m.def("compile_ptx_to_cubin",
         [](const std::string &ptxCode, const std::string &ptxasPath,
@@ -1911,59 +1992,66 @@ void init_triton_translation(py::module &m) {
           {
             py::gil_scoped_release allow_threads;
 
-            // compile ptx with ptxas
-            llvm::SmallString<64> fsrc;
-            llvm::SmallString<64> flog;
-            llvm::sys::fs::createTemporaryFile("compile-ptx-src", "", fsrc);
-            llvm::sys::fs::createTemporaryFile("compile-ptx-log", "", flog);
-            std::string fbin = std::string(fsrc) + ".o";
-            llvm::FileRemover logRemover(flog);
-            llvm::FileRemover binRemover(fbin);
-            const char *_fsrc = fsrc.c_str();
-            const char *_flog = flog.c_str();
-            const char *_fbin = fbin.c_str();
-            std::ofstream ofs(_fsrc);
-            ofs << ptxCode << std::endl;
-            ofs.close();
+            auto fn = [&]() -> bool {
+              // compile ptx with ptxas
+              llvm::SmallString<64> fsrc;
+              llvm::SmallString<64> flog;
+              llvm::sys::fs::createTemporaryFile("compile-ptx-src", "", fsrc);
+              llvm::sys::fs::createTemporaryFile("compile-ptx-log", "", flog);
+              std::string fbin = std::string(fsrc) + ".o";
+              llvm::FileRemover logRemover(flog);
+              llvm::FileRemover binRemover(fbin);
+              const char *_fsrc = fsrc.c_str();
+              const char *_flog = flog.c_str();
+              const char *_fbin = fbin.c_str();
+              std::ofstream ofs(_fsrc);
+              ofs << ptxCode << std::endl;
+              ofs.close();
 
-            auto lineInfoOption =
-                triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO")
-                    ? ""
-                    : " -lineinfo";
-            auto fmadOption = enable_fp_fusion ? "" : " --fmad=false";
-            auto capabilitySuffix = (capability == 90) ? "a " : " ";
-            auto outputFileName = std::string(_fsrc) + ".o";
-            auto logRedirect = " 2> " + std::string(_flog);
-            std::string cmd = ptxasPath + lineInfoOption + fmadOption +
-                              " -v --gpu-name=sm_" +
-                              std::to_string(capability) + capabilitySuffix +
-                              _fsrc + " -o " + outputFileName + logRedirect;
+              auto lineInfoOption =
+                  triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO")
+                      ? ""
+                      : " -lineinfo";
+              auto fmadOption = enable_fp_fusion ? "" : " --fmad=false";
+              auto capabilitySuffix = (capability == 90) ? "a " : " ";
+              auto outputFileName = std::string(_fsrc) + ".o";
+              auto logRedirect = " 2> " + std::string(_flog);
+              std::string cmd = ptxasPath + lineInfoOption + fmadOption +
+                                " -v --gpu-name=sm_" +
+                                std::to_string(capability) + capabilitySuffix +
+                                _fsrc + " -o " + outputFileName + logRedirect;
 
-            int err = system(cmd.c_str());
-            if (err != 0) {
-              err >>= 8;
-              std::ifstream _log(_flog);
-              std::string log(std::istreambuf_iterator<char>(_log), {});
-              if (err == 255) {
-                throw std::runtime_error(
-                    "Internal Triton PTX codegen error: \n" + log);
-              } else if (err == 128 + SIGSEGV) {
-                throw std::runtime_error("Please run `ptxas " +
-                                         fsrc.str().str() +
-                                         "` to confirm that this is a "
-                                         "bug in `ptxas`\n" +
-                                         log);
+              int err = system(cmd.c_str());
+              if (err != 0) {
+                err >>= 8;
+                std::ifstream _log(_flog);
+                std::string log(std::istreambuf_iterator<char>(_log), {});
+                if (err == 255) {
+                  throw std::runtime_error(
+                      "Internal Triton PTX codegen error: \n" + log);
+                } else if (err == 128 + SIGSEGV) {
+                  throw std::runtime_error("Please run `ptxas " +
+                                          fsrc.str().str() +
+                                          "` to confirm that this is a "
+                                          "bug in `ptxas`\n" +
+                                          log);
+                } else {
+                  throw std::runtime_error("`ptxas` failed with error code " +
+                                          std::to_string(err) + ": \n" + log);
+                }
+                return true;;
               } else {
-                throw std::runtime_error("`ptxas` failed with error code " +
-                                         std::to_string(err) + ": \n" + log);
+                llvm::FileRemover srcRemover(fsrc);
+                std::ifstream _cubin(_fbin, std::ios::binary);
+                cubin = std::string(std::istreambuf_iterator<char>(_cubin), {});
+                _cubin.close();
+                return false;
+                // Do not return here, exit the gil scope and return below
               }
+            };
+            bool error = executeWithThreadPool(fn);
+            if (error) {
               return {};
-            } else {
-              llvm::FileRemover srcRemover(fsrc);
-              std::ifstream _cubin(_fbin, std::ios::binary);
-              cubin = std::string(std::istreambuf_iterator<char>(_cubin), {});
-              _cubin.close();
-              // Do not return here, exit the gil scope and return below
             }
           }
           py::bytes bytes(cubin);

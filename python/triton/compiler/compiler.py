@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from .._C.libtriton.triton import (ClusterInfo, TMAInfos, add_external_libs, compile_ptx_to_cubin, get_env_vars,
                                    get_num_warps, get_shared_memory_size, ir, runtime, translate_llvmir_to_ptx,
-                                   translate_triton_gpu_to_llvmir)
+                                   translate_triton_gpu_to_llvmir, instantiate_thread_pool)
 from ..common.backend import get_backend, get_cuda_version_key, path_to_ptxas
 from ..common.build import is_hip
 # from ..runtime import driver, jit, JITFunction
@@ -697,3 +697,7 @@ class CompiledKernel:
                            CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook, self, *args_expand)
 
         return runner
+
+
+def set_thread_pool(ignored):
+    instantiate_thread_pool()

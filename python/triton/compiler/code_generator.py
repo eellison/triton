@@ -1187,13 +1187,19 @@ def kernel_suffix(signature, specialization):
             suffix += 'e'
     return suffix
 
+import functools
+
+# @functools.lru_cache(None)
+def get_context():
+    context = ir.context()
+    context.load_triton()
+    return context
 
 def ast_to_ttir(fn, signature, specialization, constants, debug, target):
     # canonicalize signature
     if isinstance(signature, str):
         signature = {k: v.strip() for k, v in enumerate(signature.split(","))}
-    context = ir.context()
-    context.load_triton()
+    context = get_context()
     # create kernel prototype
     cst_key = lambda i: fn.arg_names.index(i) if isinstance(i, str) else i
     constants = {cst_key(key): value for key, value in constants.items()}
