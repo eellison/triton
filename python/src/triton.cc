@@ -82,13 +82,18 @@ private:
   static std::mutex mtx;
 
 public:
+  static std::atomic<int> asyncCallCount; // Atomic integer to track async calls
   ThreadPoolWrapper() = default;
 
-  static llvm::ThreadPool &getInstance() {
+  static llvm::ThreadPool &getInstance(std::optional<size_t> num_threads = std::nullopt) {
     std::lock_guard<std::mutex> lock(mtx);
 
     if (!instance.threadPool) {
-      instance.threadPool.emplace(llvm::hardware_concurrency());
+      if (num_threads) {
+        instance.threadPool.emplace(llvm::hardware_concurrency(*num_threads));
+      } else {
+        instance.threadPool.emplace(llvm::hardware_concurrency());
+      }
     }
 
     return *instance.threadPool;
@@ -99,28 +104,47 @@ public:
     return instance.threadPool.has_value();
   }
 
-  // since we're sharing with MLIR context thread pool can not be discarded
-  // while those live static void discardThreadPool() {
-  //     std::lock_guard<std::mutex> lock(mtx);
-  //     instance.threadPool.reset();
-  // }
+  static void discardThreadPool() {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!instance.threadPool.has_value()) {
+      return;
+    }
+    if (ThreadPoolWrapper::asyncCallCount.load() != 0) {
+      throw std::runtime_error("Cannot discard thread pool while jobs are active");
+    }
+    instance.threadPool.reset();
+  }
 };
-
 // Define the static members
 ThreadPoolWrapper ThreadPoolWrapper::instance;
 std::mutex ThreadPoolWrapper::mtx;
+std::atomic<int> ThreadPoolWrapper::asyncCallCount{0};
+
+class AsyncCallGuard {
+public:
+    AsyncCallGuard() {
+        ThreadPoolWrapper::asyncCallCount++;
+    }
+
+    ~AsyncCallGuard() {
+        ThreadPoolWrapper::asyncCallCount--;
+    }
+};
 
 template <typename Func, typename... Args>
 auto executeWithThreadPool(Func &&fn, Args &&...args)
     -> decltype(fn(std::forward<Args>(args)...)) {
   if (ThreadPoolWrapper::isThreadPoolDefined()) {
+    AsyncCallGuard guard;
     auto future = ThreadPoolWrapper::getInstance().async(
         std::forward<Func>(fn), std::forward<Args>(args)...);
+
     return future.get();
   } else {
     return fn(std::forward<Args>(args)...);
   }
 }
+
 
 #include <pybind11/numpy.h>
 namespace py = pybind11;
@@ -312,19 +336,7 @@ void init_triton_ir(py::module &&m) {
       .value("UMAX", mlir::triton::RMWOp::UMAX);
 
   py::class_<mlir::MLIRContext>(m, "context", py::module_local())
-      .def(py::init([]() {
-             auto context = std::make_unique<mlir::MLIRContext>();
-             if (ThreadPoolWrapper::isThreadPoolDefined()) {
-               context->disableMultithreading();
-               context->setThreadPool(ThreadPoolWrapper::getInstance());
-              //  std::cout << " New Path \n";
-             } else { 
-                // std::cout << " Other path \n";
-             }
-             return context.release();
-           }),
-           py::return_value_policy::take_ownership) // Specify the ownership
-                                                    // policy
+      .def(py::init<>())
       .def("load_triton", [](mlir::MLIRContext &self) {
         self.getOrLoadDialect<mlir::triton::TritonDialect>();
         self.getOrLoadDialect<mlir::index::IndexDialect>();
