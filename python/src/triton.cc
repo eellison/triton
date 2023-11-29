@@ -45,16 +45,13 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/ThreadPool.h"
 
 #include "llvm/Support/SourceMgr.h"
 
 #include <Python.h>
 #include <cctype>
-#include <condition_variable>
 #include <fstream>
-#include <functional>
-#include <iostream>
-#include <mutex>
 #include <optional>
 #include <pybind11/buffer_info.h>
 #include <pybind11/embed.h>
@@ -62,18 +59,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
-#include <queue>
 #include <regex>
 #include <signal.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <vector>
 
-#include <llvm/Support/ThreadPool.h>
-#include <mutex>
-#include <optional>
 
 class ThreadPoolWrapper {
 private:
@@ -347,6 +338,12 @@ void init_triton_ir(py::module &&m) {
         self.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
         self.getOrLoadDialect<mlir::tensor::TensorDialect>();
       });
+  // .def(py::init([](){
+  //   mlir::MLIRContext context;
+  //   context.getOrLoadDialect<mlir::triton.TritonDialect>();
+  //   // TODO: should we return a (raw/unique) pointer here?
+  //   return context;
+  // }));
 
   // py::class_<ir::value>(m, "value")
   //     .def("multiple_of", [](ir::value *self, int val) {
@@ -1984,17 +1981,8 @@ void init_triton_translation(py::module &m) {
       },
       ret::take_ownership);
 
-  m.def("get_num_threads", []() {
-    if (!ThreadPoolWrapper::isThreadPoolDefined()) {
-      return 0;
-    } else {
-      return static_cast<int>(
-          ThreadPoolWrapper::getInstance().getThreadCount());
-    }
-  });
-
-  m.def("instantiate_thread_pool", []() {
-    ThreadPoolWrapper::getInstance();
+  m.def("instantiate_thread_pool", [](std::optional<size_t> num_threads = std::nullopt) {
+    ThreadPoolWrapper::getInstance(num_threads);
   });
 
   m.def("compile_ptx_to_cubin",
