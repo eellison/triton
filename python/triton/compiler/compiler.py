@@ -717,3 +717,19 @@ class CompiledKernel:
                            CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook, self, *args_expand)
 
         return runner
+
+
+def set_thread_pool_enabled(enabled: bool):
+    """
+    Enables or disables a thread pool that will be used for triton compilation steps in C++.
+
+    :param enabled: whether to enable thread C++ thread pool.
+    """
+    set_thread_pool_enabled_impl(enabled)
+
+
+def is_thread_pool_enabled():
+    """
+    Is the C++ thread pool enabled
+    """
+    return is_thread_pool_enabled_impl()
