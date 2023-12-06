@@ -73,7 +73,7 @@ static llvm::ThreadPool &getThreadPoolSingleton() {
 }
 
 static std::atomic<bool> &useThreadPoolFlagSingleton() {
-  static std::atomic<bool> useThreadPool{false};
+  static std::atomic<bool> useThreadPool{true};
   return useThreadPool;
 }
 
