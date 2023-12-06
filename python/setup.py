@@ -80,15 +80,18 @@ def get_llvm_package_info():
             arch = "x64"
         system_suffix = f"macos-{arch}"
     elif system == "Linux":
-        # TODO: arm64
-        vglibc = tuple(map(int, platform.libc_ver()[1].split('.')))
-        vglibc = vglibc[0] * 100 + vglibc[1]
-        system_suffix = 'ubuntu-x64' if vglibc > 217 else 'centos-x64'
+        if arch == 'arm64':
+            system_suffix = 'ubuntu-arm64'
+        else:
+            vglibc = tuple(map(int, platform.libc_ver()[1].split('.')))
+            vglibc = vglibc[0] * 100 + vglibc[1]
+            system_suffix = 'ubuntu-x64' if vglibc > 217 else 'centos-x64'
     else:
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     # use_assert_enabled_llvm = check_env_flag("TRITON_USE_ASSERT_ENABLED_LLVM", "False")
     # release_suffix = "assert" if use_assert_enabled_llvm else "release"
-    rev = "49af6502"
+    llvm_hash_file = open("../cmake/llvm-hash.txt", "r")
+    rev = llvm_hash_file.read(8)
     name = f"llvm-{rev}-{system_suffix}"
     url = f"https://tritonlang.blob.core.windows.net/llvm-builds/{name}.tar.gz"
     return Package("llvm", name, url, "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
@@ -341,8 +344,8 @@ download_and_copy(
 )
 
 setup(
-    name="triton",
-    version="2.1.0",
+    name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
+    version="2.1.0" + os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", ""),
     author="Philippe Tillet",
     author_email="phil@openai.com",
     description="A language and compiler for custom Deep Learning operations",
@@ -352,6 +355,7 @@ setup(
         "triton/_C",
         "triton/common",
         "triton/compiler",
+        "triton/compiler/backends",
         "triton/language",
         "triton/language/extra",
         "triton/ops",

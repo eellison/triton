@@ -3,14 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial, wraps
-from typing import Callable, List, Sequence, TypeVar
+from typing import Union, Callable, List, Sequence, TypeVar, cast
 
 from .._C.libtriton.triton import ir
 from . import semantic
 
 T = TypeVar('T')
 
-TRITON_MAX_TENSOR_NUMEL = 131072
+TRITON_MAX_TENSOR_NUMEL = 1048576
 
 TRITON_BUILTIN = "__triton_builtin__"
 
@@ -44,11 +44,11 @@ def _to_tensor(x, builder):
         if -2**31 <= x < 2**31:
             return tensor(builder.get_int32(x), int32)
         elif 2**31 <= x < 2**32:
-            return tensor(builder.get_int32(x), uint32)
+            return tensor(builder.get_uint32(x), uint32)
         elif -2**63 <= x < 2**63:
             return tensor(builder.get_int64(x), int64)
         elif 2**63 <= x < 2**64:
-            return tensor(builder.get_int64(x), uint64)
+            return tensor(builder.get_uint64(x), uint64)
         else:
             raise RuntimeError(f'Nonrepresentable integer {x}.')
     elif isinstance(x, float):
@@ -274,6 +274,12 @@ class dtype:
 
     def __repr__(self):
         return f'triton.language.{str(self)}'
+
+
+# Some functions have a param named `dtype`, which shadows the `dtype` class.
+# We can't change the param name because it is part of function's public API.
+# Declare an alias so those functions can still reference the dtype class.
+_DtypeClass = dtype
 
 
 class pointer_type(dtype):
@@ -923,9 +929,8 @@ def cat(input, other, can_reorder=False, _builder=None):
     :param other: The second input tensor.
     :type other:
     :param reorder: Compiler hint. If true, the compiler is
-    allowed to reorder elements while concatenating inputs.
-    Only use if the order does not matter (e.g., result is
-    only used in reduction ops)
+        allowed to reorder elements while concatenating inputs.  Only use if the
+        order does not matter (e.g., result is only used in reduction ops)
     """
     return semantic.cat(input, other, can_reorder, _builder)
 
@@ -1309,7 +1314,7 @@ def fdiv(x, y, ieee_rounding=False, _builder=None):
     :param x: the input numerator value.
     :param y: the input denominator value.
     :param ieee_rounding: To follow IEEE-754 floating point number
-    rounding mechanism
+        rounding mechanism
     :type ieee_rounding: bool
     """
     ieee_rounding = _constexpr_to_value(ieee_rounding)
@@ -1448,7 +1453,6 @@ def _promote_reduction_input(t, _builder=None):
     # hardware doesn't support FMAX, FMIN, CMP for bfloat16
     if scalar_ty is bfloat16:
         return t.to(float32, _builder=_builder)
-
     return t
 
 
@@ -1536,7 +1540,7 @@ def debug_barrier(_builder=None):
 @builtin
 def multiple_of(input, values, _builder=None):
     """
-    Let the compiler knows that the values in :code:`input` are all multiples of :code:`value`.
+    Let the compiler know that the values in :code:`input` are all multiples of :code:`value`.
     """
     if isinstance(values, constexpr):
         values = [values]
@@ -1552,7 +1556,7 @@ def multiple_of(input, values, _builder=None):
 @builtin
 def max_contiguous(input, values, _builder=None):
     """
-    Let the compiler knows that the `value` first values in :code:`input` are contiguous.
+    Let the compiler know that the `value` first values in :code:`input` are contiguous.
     """
     if isinstance(values, constexpr):
         values = [values]
@@ -1568,7 +1572,7 @@ def max_contiguous(input, values, _builder=None):
 @builtin
 def max_constancy(input, values, _builder=None):
     """
-    Let the compiler knows that the `value` first values in :code:`input` are constant.
+    Let the compiler know that the `value` first values in :code:`input` are constant.
 
     e.g. if :code:`values` is [4], then each group of 4 values in :code:`input` should all be equal,
     for example [0, 0, 0, 0, 1, 1, 1, 1].
@@ -1684,7 +1688,7 @@ def device_assert(cond, msg="", _builder=None):
     lineno = 0
     func_name = 'unknown'
     file_name = 'unknown'
-    if frame is not None:
+    if frame is not None and frame.f_back is not None:
         func_name = frame.f_code.co_name
         file_name = frame.f_back.f_code.co_filename
         # TODO: The line number currently indicates the line
@@ -1695,25 +1699,112 @@ def device_assert(cond, msg="", _builder=None):
 
 
 @builtin
-def inline_asm_elementwise(asm: str, constraints: str, args: list, dtype, is_pure: bool, pack: int, _builder=None):
+def inline_asm_elementwise(asm: str, constraints: str, args: Sequence, dtype: Union[dtype, Sequence[dtype]],
+                           is_pure: bool, pack: int, _builder=None):
     '''
-        Execute the inline assembly to a packed of elements of the tensor
-        :param asm: assembly to be inlined, it has to match the target assembly format
-        :param constraints: string representing the mapping of operands to register
-        :param args: the arguments of the operation
-        :param dtype: the element type of the returned variable
-        :param is_pure: whether the operation is pure
+        Execute inline assembly over a tensor.  Essentially, this is :code:`map`
+        where the function is inline assembly.
+
+        The input tensors :code:`args` are implicitly broadcasted to the same shape.
+
+        :code:`dtype` can be a tuple of types, in which case the output is a
+        tuple of tensors.
+
+        Each invocation of the inline asm processes :code:`pack` elements at a
+        time.  Exactly which set of inputs a block receives is unspecified.
+        Input elements of size less than 4 bytes are packed into 4-byte
+        registers.
+
+        This op does not support empty :code:`dtype` -- the inline asm must
+        return at least one tensor, even if you don't need it.  You can work
+        around this by returning a dummy tensor of arbitrary type; it shouldn't
+        cost you anything if you don't use it.
+
+        Example using
+        [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+        assembly:
+
+        .. highlight:: python
+        .. code-block:: python
+
+        @triton.jit
+        def kernel(A, B, C, D, BLOCK: tl.constexpr):
+            a = tl.load(A + tl.arange(0, BLOCK)) # uint8 tensor
+            b = tl.load(B + tl.arange(0, BLOCK)) # float32 tensor
+
+            # For each (a,b) in zip(a,b), perform the following:
+            # - Let ai be `a` converted to int32.
+            # - Let af be `a` converted to float.
+            # - Let m be the max of ai and b.
+            # - Return ai and mi.
+            # Do the above 4 elements at a time.
+            (c, d) = tl.inline_asm_elementwise(
+                asm="""
+                {
+                    // Unpack `a` into `ai`.
+                    .reg .b8 tmp<4>;
+                    mov.b32 {tmp0, tmp1, tmp2, tmp3}, $8;
+                    cvt.u32.u8 $0, tmp0;
+                    cvt.u32.u8 $1, tmp1;
+                    cvt.u32.u8 $2, tmp2;
+                    cvt.u32.u8 $3, tmp3;
+                }
+                // Convert `ai` to float.
+                cvt.rn.f32.s32 $4, $0;
+                cvt.rn.f32.s32 $5, $1;
+                cvt.rn.f32.s32 $6, $2;
+                cvt.rn.f32.s32 $7, $3;
+                // Take max of `ai` and `b`.
+                max.f32 $4, $4, $9;
+                max.f32 $5, $5, $10;
+                max.f32 $6, $6, $11;
+                max.f32 $7, $7, $12;
+                """,
+                constraints=(
+                    # 8 output registers, namely
+                    #   $0=ai0, $1=ai1, $2=ai2, $3=ai3,
+                    #   $4=m0,  $5=m1,  $6=m2,  $7=m3.
+                    "=r,=r,=r,=r,=r,=r,=r,=r,"
+                    # 5 input registers, namely
+                    #   $8=ai,
+                    #   $9=b0, $10=b1, $11=b2, $12=b3.
+                    # The four elements from `a` are all packed into one register.
+                    "r,r,r,r,r"),
+                args=[a, b],
+                dtype=(tl.int32, tl.float32),
+                is_pure=True,
+                pack=4,
+            )
+            tl.store(C + tl.arange(0, BLOCK), c)
+            tl.store(D + tl.arange(0, BLOCK), d)
+
+        :param asm: assembly to run.  Must match target's assembly format.
+        :param constraints: asm constraints in
+            [LLVM format](https://llvm.org/docs/LangRef.html#inline-asm-constraint-string)
+        :param args: the input tensors, whose values are passed to the asm block
+        :param dtype: the element type(s) of the returned tensor(s)
+        :param is_pure: if true, the compiler assumes the asm block has no side-effects
         :param pack: the number of elements to be processed by one instance of inline assembly
         :param _builder: the builder
-        :return: the return value of the function
+        :return: one tensor or a tuple of tensors of the given dtypes
     '''
     asm = _constexpr_to_value(asm)
     constraints = _constexpr_to_value(constraints)
     pack = _constexpr_to_value(pack)
     is_pure = _constexpr_to_value(is_pure)
-    res_ty = dtype
-    dispatch_args = [_to_tensor(arg, _builder) for arg in args]
-    if dispatch_args:
+
+    # Wrap `dtype` in a tuple if it's not already.
+    try:
+        iter(dtype)  # type: ignore
+        has_multiple_outputs = True
+    except TypeError:
+        has_multiple_outputs = False
+        dtype = (dtype, )  # type: ignore
+
+    dtype = cast(Sequence[_DtypeClass], dtype)
+
+    res_tys = dtype
+    if dispatch_args := [_to_tensor(arg, _builder) for arg in args]:
         bin_op_type_checking = partial(
             semantic.binary_op_type_checking_impl,
             builder=_builder,
@@ -1729,10 +1820,13 @@ def inline_asm_elementwise(asm: str, constraints: str, args: list, dtype, is_pur
             # Change the shape of each argument based on the broadcast shape
             for i, item in enumerate(dispatch_args):
                 dispatch_args[i], _ = bin_op_type_checking(item, broadcast_arg)
-            res_ty = block_type(dtype, broadcast_arg.shape)
+            res_tys = [block_type(dt, broadcast_arg.shape) for dt in dtype]
     handles = [t.handle for t in dispatch_args]
-    call = _builder.create_inline_asm(asm, constraints, handles, res_ty.to_ir(_builder), is_pure, pack)
-    return tensor(call, res_ty)
+    call = _builder.create_inline_asm(asm, constraints, handles, [ty.to_ir(_builder) for ty in res_tys], is_pure, pack)
+
+    if not has_multiple_outputs:
+        return tensor(call.get_result(0), res_tys[0])
+    return tuple(tensor(call.get_result(i), ty) for i, ty in enumerate(res_tys))
 
 
 # -----------------------

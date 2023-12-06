@@ -15,6 +15,7 @@ from .standard import (
     minimum,
     sigmoid,
     softmax,
+    sort,
     sum,
     ravel,
     swizzle2d,
@@ -106,7 +107,7 @@ from .random import (
     randint4x,
     randn,
     randn4x,
-    uint32_to_uniform_float,
+    uint_to_uniform_float,
 )
 
 __all__ = [
@@ -191,6 +192,7 @@ __all__ = [
     "sigmoid",
     "sin",
     "softmax",
+    "sort",
     "sqrt",
     "static_range",
     "static_assert",
@@ -203,7 +205,7 @@ __all__ = [
     "triton",
     "uint16",
     "uint32",
-    "uint32_to_uniform_float",
+    "uint_to_uniform_float",
     "uint64",
     "uint8",
     "umulhi",
