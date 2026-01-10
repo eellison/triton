@@ -549,6 +549,46 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   auto smem = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc,
                                tileDst, src.getOutDims());
 
+  // If there are bank conflicts and one side has no bank-bit coverage,
+  // inject bank bits from the other side via XOR and retry.
+  auto [readConflicts, writeConflicts] =
+      bankConflictsLdSt(srcFlat, dstFlat, smem, bitwidth);
+  if (readConflicts > 0 || writeConflicts > 0) {
+    auto computeBankBitCoverage =
+        [bitwidth](ArrayRef<int32_t> tile) -> int32_t {
+      int32_t byteShift = bitwidth / 8;
+      int32_t log2ByteShift = byteShift > 1 ? llvm::Log2_32(byteShift) : 0;
+      int32_t bankMask = 31 << std::max(0, 2 - log2ByteShift);
+      int32_t coverage = 0;
+      for (int32_t t : tile)
+        coverage |= (t & bankMask);
+      return coverage;
+    };
+
+    int32_t srcCoverage = computeBankBitCoverage(tileSrc);
+    int32_t dstCoverage = computeBankBitCoverage(tileDst);
+    bool needsRetry = false;
+
+    if (srcCoverage == 0 && dstCoverage != 0) {
+      for (size_t i = 0; i < tileSrc.size(); ++i)
+        tileSrc[i] ^= (i < tileDst.size()) ? tileDst[i] : 0;
+      needsRetry = true;
+    } else if (dstCoverage == 0 && srcCoverage != 0) {
+      for (size_t i = 0; i < tileDst.size(); ++i)
+        tileDst[i] ^= (i < tileSrc.size()) ? tileSrc[i] : 0;
+      needsRetry = true;
+    }
+
+    if (needsRetry) {
+      auto smemRetry = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis,
+                                        tileSrc, tileDst, src.getOutDims());
+      auto [retryRead, retryWrite] =
+          bankConflictsLdSt(srcFlat, dstFlat, smemRetry, bitwidth);
+      if (retryRead + retryWrite < readConflicts + writeConflicts)
+        smem = std::move(smemRetry);
+    }
+  }
+
   // We might be able to vectorise a bit more the load or the store
   // This may happen when there is broadcasting
   // e.g for fp32

@@ -276,6 +276,36 @@ TEST_F(SwizzleTest, Test128x128F16Transpose) {
   EXPECT_EQ(w, 0);
 }
 
+// Test for degenerate case where one side's lane bases have no bank-bit
+// coverage. This reproduces the mxfp8 to_mxfp8_dim1 kernel pattern where
+// linear layout has lane bases like [512, 1024, 2048, 4096, 1] which all
+// have bits 2-6 = 0, causing all lanes to hit the same bank.
+// The fix detects this case and injects bank bits from the other side via XOR.
+TEST_F(SwizzleTest, Test64x128Float8NoBankCoverage) {
+  // linear2 layout: lane bases have no coverage of bits 2-6 (bank bits)
+  // This models the mxfp8 kernel's linear layout for col-major output
+  LinearLayout linear(
+      {{S("register"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}}},
+       {S("lane"), {{0, 8}, {0, 16}, {0, 32}, {0, 64}, {1, 0}}},
+       {S("warp"), {{0, 1}, {0, 2}, {0, 4}}}},
+      {{S("dim0"), 64}, {S("dim1"), 128}},
+      /*requireSurjective=*/true);
+
+  // blocked2 layout: normal blocked layout with bank-bit coverage
+  LinearLayout blocked(
+      {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {0, 32}}},
+       {S("lane"), {{0, 64}, {1, 0}, {2, 0}, {4, 0}, {8, 0}}},
+       {S("warp"), {{16, 0}, {32, 0}, {0, 0}}}},
+      {{S("dim0"), 64}, {S("dim1"), 128}},
+      /*requireSurjective=*/true);
+
+  auto smem = optimalSwizzlingLdSt(linear, blocked, /*bitwidth=*/8);
+  auto [r, w] = bankConflictsLdSt(linear, blocked, smem, /*bitwidth=*/8);
+  // Ideally we should have no bank conflicts on either side
+  EXPECT_EQ(r, 0);
+  EXPECT_EQ(w, 0);
+}
+
 TEST_F(BankConflictTest, bankConflicts) {
   using mlir::triton::gpu::DotOperandEncodingAttr;
 
